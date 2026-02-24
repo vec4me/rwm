@@ -21,6 +21,7 @@
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_cursor.h>
+#include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_pointer.h>
@@ -36,7 +37,7 @@
 #include <xkbcommon/xkbcommon.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 #include "sysinfo.h"
 
@@ -65,7 +66,7 @@
 	do { (listener)->notify = (handler); wl_signal_add((signal), (listener)); } while(0)
 
 #define view_is_visible(view, srv) \
-	((view)->workspace == (srv)->current_workspace && \
+	((view)->workspace == (srv)->workspace && \
 	 (view)->state != VIEW_MINIMIZED)
 
 #define for_each_visible_view(view, srv) \
@@ -80,30 +81,25 @@
 /* Enums                                                                       */
 /* ========================================================================== */
 
-enum box_style   { STYLE_FLAT = 0, STYLE_RAISED = 1, STYLE_SUNKEN = 2, STYLE_TEXTURED = 3, STYLE_GLYPH = 4 };
 enum box_icon    { ICON_NONE = 0, ICON_MINIMIZE = 1, ICON_MAXIMIZE = 2, ICON_CLOSE = 3 };
+
+/* Internal style values for shader */
+#define STYLE_RAISED   1
+#define STYLE_SUNKEN   2
+#define STYLE_TEXTURED 3
+#define STYLE_GLYPH    4
 enum view_state  { VIEW_NORMAL = 0, VIEW_MAXIMIZED, VIEW_FULLSCREEN, VIEW_MINIMIZED };
 
 /* ========================================================================== */
 /* Structs                                                                     */
 /* ========================================================================== */
 
-struct box_colors {
-	float face[4];
-	float bevel_light[4];
-	float bevel_dark[4];
-	float inner_shadow[4];
-};
-
-struct ui_vertex {
-	float pos[2];
-	float box_xywh[4];
-	float face_color[4];
-	float bevel_light[4];
-	float bevel_dark[4];
-	float inner_shadow[4];
-	float params[3];
-};
+struct box_instance {
+	float box_xywh[4];       /* 16 bytes */
+	float data[4];    /* 16 bytes: RGBA as floats, or UV coords for glyphs */
+	uint8_t params[4];       /* 4 bytes: style, icon, pad, pad */
+	uint8_t pad[4];          /* 4 bytes padding for alignment */
+}; /* 40 bytes */
 
 struct glyph_info {
 	float u0, v0, u1, v1;
@@ -122,6 +118,7 @@ struct view {
 	uint8_t workspace;
 	enum view_state state;
 	pid_t pid;
+	char title[256];
 	struct wlr_xdg_toplevel_decoration_v1 *decoration;
 
 	struct wl_listener map;
@@ -198,24 +195,22 @@ struct server {
 	struct wlr_allocator *allocator;
 	struct wlr_output_layout *output_layout;
 
-	/* Shared fullscreen quad VBO (clip-space: -1..1) */
-	GLuint quad_vbo;
-
 	/* Background shader */
-	GLuint bg_shader_program;
+	GLuint bg_prog;
 	GLint bg_time_loc;
 	GLint bg_resolution_loc;
 	struct timespec start_time;
 
-	/* UI box shader (batched) */
-	GLuint ui_shader_program;
-	GLuint ui_ext_shader_program;
-	GLuint ui_vbo;
-	GLint ui_resolution_loc;
-	GLint ui_ext_resolution_loc;
-	struct wlr_output *current_output;
-	struct ui_vertex ui_batch[UI_BATCH_MAX * 6];
-	size_t ui_batch_count;
+	/* UI box shader (instanced) */
+	GLuint ui_prog;
+	GLuint ext_prog;
+	GLuint quad_vbo;         /* shared unit quad (0..1) */
+	GLuint inst_vbo;  /* per-box instance data */
+	GLint res_loc;
+	GLint ext_res_loc;
+	struct wlr_output *output;
+	struct box_instance batch[UI_BATCH_MAX];
+	size_t batch_n;
 
 	/* Glyph atlas */
 	GLuint glyph_atlas;
@@ -229,11 +224,16 @@ struct server {
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
 
-	uint8_t current_workspace;
+	uint8_t workspace;
 	struct view *focused_view;
 
 	struct wlr_cursor *cursor;
-	GLuint cursor_texture;
+	struct wlr_xcursor_manager *xcursor_manager;
+	double prev_cursor_x, prev_cursor_y;
+
+	/* Cursor blur shader */
+	GLuint blur_prog;
+	GLint blur_rect_loc, blur_resolution_loc, blur_blur_loc, blur_vel_loc;
 
 	struct wl_listener cursor_motion;
 	struct wl_listener cursor_motion_absolute;
@@ -268,10 +268,10 @@ struct server {
 	xkb_keysym_t snap_chord;
 
 	/* Find-window overlay */
-	bool find_window_open;
-	char find_window_query[128];
-	size_t find_window_query_len;
-	size_t find_window_selected;
+	bool find_open;
+	char find_query[128];
+	size_t find_query_len;
+	size_t find_selected;
 
 	/* Cached frame time */
 	struct timespec frame_time;
@@ -282,35 +282,15 @@ struct server {
 
 	/* Night mode (blue light filter) */
 	bool night_mode;
-	GLuint night_shader_program;
+	GLuint night_prog;
 };
 
 /* ========================================================================== */
 /* Color constants                                                             */
 /* ========================================================================== */
 
-static const struct box_colors win95_button_colors = {
-	.face         = {0.75f, 0.75f, 0.75f, 1.0f},
-	.bevel_light  = {1.0f,  1.0f,  1.0f,  1.0f},
-	.bevel_dark   = {0.0f,  0.0f,  0.0f,  1.0f},
-	.inner_shadow = {0.5f,  0.5f,  0.5f,  1.0f},
-};
-
-static const struct box_colors win95_frame_active_colors = {
-	.face         = {0.65f, 0.65f, 0.85f, 1.0f},
-	.bevel_light  = {0.85f, 0.85f, 1.0f,  1.0f},
-	.bevel_dark   = {0.3f,  0.3f,  0.5f,  1.0f},
-	.inner_shadow = {0.45f, 0.45f, 0.65f, 1.0f},
-};
-
-static const struct box_colors win95_taskbar_colors = {
-	.face         = {0.75f, 0.75f, 0.75f, 1.0f},
-	.bevel_light  = {1.0f,  1.0f,  1.0f,  1.0f},
-	.bevel_dark   = {0.75f, 0.75f, 0.75f, 1.0f},
-	.inner_shadow = {0.75f, 0.75f, 0.75f, 1.0f},
-};
-
-static const struct box_colors no_colors = {0};
+static const uint8_t COLOR_BUTTON[4]       = {191, 191, 191, 255};
+static const uint8_t COLOR_FRAME_ACTIVE[4] = {166, 166, 217, 255};
 
 /* ========================================================================== */
 /* Global server instance                                                      */
@@ -349,32 +329,21 @@ static const char ui_vertex_shader_src[] =
 	"attribute vec2 a_pos;\n"
 	"attribute vec4 a_box;\n"
 	"attribute vec4 a_face_color;\n"
-	"attribute vec4 a_bevel_light;\n"
-	"attribute vec4 a_bevel_dark;\n"
-	"attribute vec4 a_inner_shadow;\n"
-	"attribute vec3 a_params;\n"
+	"attribute vec4 a_params;\n"
 	"uniform vec2 u_resolution;\n"
 	"varying vec2 v_local_pos;\n"
 	"varying vec2 v_box_size;\n"
 	"varying vec4 v_face_color;\n"
-	"varying vec4 v_bevel_light;\n"
-	"varying vec4 v_bevel_dark;\n"
-	"varying vec4 v_inner_shadow;\n"
-	"varying vec3 v_params;\n"
+	"varying vec2 v_params;\n"
 	"varying vec2 v_uv;\n"
 	"void main() {\n"
 	"    vec2 pixel = a_box.xy + a_pos * a_box.zw;\n"
-	"    vec2 clip;\n"
-	"    clip.x = (pixel.x / u_resolution.x) * 2.0 - 1.0;\n"
-	"    clip.y = (pixel.y / u_resolution.y) * 2.0 - 1.0;\n"
+	"    vec2 clip = pixel / u_resolution * 2.0 - 1.0;\n"
 	"    gl_Position = vec4(clip, 0.0, 1.0);\n"
 	"    v_local_pos = a_pos * a_box.zw;\n"
 	"    v_box_size = a_box.zw;\n"
 	"    v_face_color = a_face_color;\n"
-	"    v_bevel_light = a_bevel_light;\n"
-	"    v_bevel_dark = a_bevel_dark;\n"
-	"    v_inner_shadow = a_inner_shadow;\n"
-	"    v_params = a_params;\n"
+	"    v_params = a_params.xy * 255.0;\n"
 	"    v_uv = a_pos;\n"
 	"}\n";
 
@@ -383,78 +352,51 @@ static const char ui_fragment_shader_src[] =
 	"varying vec2 v_local_pos;\n"
 	"varying vec2 v_box_size;\n"
 	"varying vec4 v_face_color;\n"
-	"varying vec4 v_bevel_light;\n"
-	"varying vec4 v_bevel_dark;\n"
-	"varying vec4 v_inner_shadow;\n"
-	"varying vec3 v_params;\n"
+	"varying vec2 v_params;\n"
 	"varying vec2 v_uv;\n"
 	"uniform sampler2D u_tex;\n"
 	"void main() {\n"
-	"    if (v_params.x > 3.5) {\n"
-	"        vec2 uv = mix(v_face_color.xy, v_face_color.zw, v_uv);\n"
-	"        gl_FragColor = v_bevel_light * texture2D(u_tex, uv).a;\n"
-	"        return;\n"
-	"    }\n"
-	"    if (v_params.x > 2.5) { gl_FragColor = texture2D(u_tex, v_uv); return; }\n"
-	"    float x = v_local_pos.x;\n"
-	"    float y = v_local_pos.y;\n"
-	"    float w = v_box_size.x;\n"
-	"    float h = v_box_size.y;\n"
 	"    float style = v_params.x;\n"
 	"    float icon = v_params.y;\n"
-	"    float icon_margin = v_params.z;\n"
-	"    vec4 color = v_face_color;\n"
+	"    if (style > 3.5) {\n"
+	"        vec2 uv = mix(v_face_color.xy, v_face_color.zw, v_uv);\n"
+	"        gl_FragColor = vec4(0.0, 0.0, 0.0, texture2D(u_tex, uv).r);\n"
+	"        return;\n"
+	"    }\n"
+	"    if (style > 2.5) { gl_FragColor = texture2D(u_tex, v_uv); return; }\n"
+	"    float x = v_local_pos.x, y = v_local_pos.y;\n"
+	"    float w = v_box_size.x, h = v_box_size.y;\n"
+	"    vec4 face = v_face_color;\n"
+	"    vec4 light = vec4(min(face.rgb + 0.25, vec3(1.0)), 1.0);\n"
+	"    vec4 dark = vec4(face.rgb * 0.4, 1.0);\n"
+	"    vec4 inner = vec4(face.rgb * 0.67, 1.0);\n"
+	"    vec4 color = face;\n"
 	"    if (style > 0.5) {\n"
-	"        vec4 tl_color;\n"
-	"        vec4 br_color;\n"
-	"        vec4 inn_color;\n"
-	"        if (style < 1.5) {\n"
-	"            tl_color = v_bevel_light;\n"
-	"            br_color = v_bevel_dark;\n"
-	"            inn_color = v_inner_shadow;\n"
-	"        } else {\n"
-	"            tl_color = v_bevel_dark;\n"
-	"            br_color = v_bevel_light;\n"
-	"            inn_color = v_face_color;\n"
-	"        }\n"
-	"        if (y < 1.0) { color = tl_color; }\n"
-	"        else if (x < 1.0) { color = tl_color; }\n"
-	"        else if (y >= h - 1.0) { color = br_color; }\n"
-	"        else if (x >= w - 1.0) { color = br_color; }\n"
-	"        else if (x >= w - 2.0) { color = inn_color; }\n"
-	"        else if (y >= h - 2.0) { color = inn_color; }\n"
+	"        vec4 tl = style < 1.5 ? light : dark;\n"
+	"        vec4 br = style < 1.5 ? dark : light;\n"
+	"        vec4 inn = style < 1.5 ? inner : face;\n"
+	"        if (y < 1.0 || x < 1.0) color = tl;\n"
+	"        else if (y >= h - 1.0 || x >= w - 1.0) color = br;\n"
+	"        else if (x >= w - 2.0 || y >= h - 2.0) color = inn;\n"
 	"    }\n"
 	"    if (icon > 0.5) {\n"
-	"        float m = icon_margin;\n"
-	"        float iw = w - m * 2.0;\n"
-	"        float ih = h - m * 2.0;\n"
-	"        float ix = x - m;\n"
-	"        float iy = y - m;\n"
-	"        bool is_icon = false;\n"
+	"        float m = 4.0;\n"
+	"        float iw = w - m * 2.0, ih = h - m * 2.0;\n"
+	"        float ix = x - m, iy = y - m;\n"
+	"        bool hit = false;\n"
 	"        if (icon < 1.5) {\n"
-	"            if (ix >= 0.0 && ix < iw && iy >= ih - 2.0 && iy < ih)\n"
-	"                is_icon = true;\n"
+	"            hit = ix >= 0.0 && ix < iw && iy >= ih - 2.0 && iy < ih;\n"
 	"        } else if (icon < 2.5) {\n"
-	"            if (ix >= 0.0 && ix < iw && iy >= 0.0 && iy < 2.0)\n"
-	"                is_icon = true;\n"
-	"            else if (ix >= 0.0 && ix < 1.0 && iy >= 0.0 && iy < ih)\n"
-	"                is_icon = true;\n"
-	"            else if (ix >= iw - 1.0 && ix < iw && iy >= 0.0 && iy < ih)\n"
-	"                is_icon = true;\n"
-	"            else if (iy >= ih - 1.0 && iy < ih && ix >= 0.0 && ix < iw)\n"
-	"                is_icon = true;\n"
+	"            hit = (ix >= 0.0 && ix < iw && iy >= 0.0 && iy < 2.0) ||\n"
+	"                  (ix >= 0.0 && ix < 1.0 && iy >= 0.0 && iy < ih) ||\n"
+	"                  (ix >= iw-1.0 && ix < iw && iy >= 0.0 && iy < ih) ||\n"
+	"                  (iy >= ih-1.0 && iy < ih && ix >= 0.0 && ix < iw);\n"
 	"        } else {\n"
-	"            float nx = ix / iw;\n"
-	"            float ny = iy / ih;\n"
-	"            float thick = 2.0 / iw;\n"
-	"            float d1 = abs(nx - ny);\n"
-	"            float d2 = abs(nx - (1.0 - ny));\n"
-	"            if (ix >= 0.0 && ix < iw && iy >= 0.0 && iy < ih) {\n"
-	"                if (d1 < thick || d2 < thick)\n"
-	"                    is_icon = true;\n"
-	"            }\n"
+	"            float nx = ix/iw, ny = iy/ih, t = 2.0/iw;\n"
+	"            hit = ix >= 0.0 && ix < iw && iy >= 0.0 && iy < ih &&\n"
+	"                  (abs(nx-ny) < t || abs(nx-(1.0-ny)) < t);\n"
 	"        }\n"
-	"        if (is_icon) { color = vec4(0.0, 0.0, 0.0, 1.0); }\n"
+	"        if (hit) color = vec4(0.0, 0.0, 0.0, 1.0);\n"
 	"    }\n"
 	"    gl_FragColor = color;\n"
 	"}\n";
@@ -462,23 +404,14 @@ static const char ui_fragment_shader_src[] =
 static const char ui_fragment_shader_external_src[] =
 	"#extension GL_OES_EGL_image_external : require\n"
 	"precision mediump float;\n"
-	"varying vec2 v_local_pos;\n"
-	"varying vec2 v_box_size;\n"
-	"varying vec4 v_face_color;\n"
-	"varying vec4 v_bevel_light;\n"
-	"varying vec4 v_bevel_dark;\n"
-	"varying vec4 v_inner_shadow;\n"
-	"varying vec3 v_params;\n"
 	"varying vec2 v_uv;\n"
 	"uniform samplerExternalOES u_tex;\n"
-	"void main() {\n"
-	"    gl_FragColor = texture2D(u_tex, v_uv);\n"
-	"}\n";
+	"void main() { gl_FragColor = texture2D(u_tex, v_uv); }\n";
 
 static const char quad_vertex_shader_src[] =
 	"attribute vec2 a_pos;\n"
 	"void main() {\n"
-	"    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+	"    gl_Position = vec4(a_pos * 2.0 - 1.0, 0.0, 1.0);\n"
 	"}\n";
 
 static const char night_fragment_shader_src[] =
@@ -487,15 +420,41 @@ static const char night_fragment_shader_src[] =
 	"    gl_FragColor = vec4(1.0, 0.85, 0.6, 1.0);\n"
 	"}\n";
 
+static const char blur_vertex_shader_src[] =
+	"attribute vec2 a_pos;\n"
+	"uniform vec4 u_rect;\n"
+	"uniform vec2 u_resolution;\n"
+	"varying vec2 v_uv;\n"
+	"void main() {\n"
+	"    v_uv = a_pos;\n"
+	"    vec2 p = u_rect.xy + a_pos * u_rect.zw;\n"
+	"    gl_Position = vec4(p / u_resolution * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n";
+
+static const char blur_fragment_shader_src[] =
+	"precision mediump float;\n"
+	"varying vec2 v_uv;\n"
+	"uniform sampler2D u_tex;\n"
+	"uniform vec4 u_blur;\n"  /* origin.xy, scale.zw */
+	"uniform vec2 u_vel;\n"
+	"void main() {\n"
+	"    vec2 sv = u_vel + (1.0 - step(0.001, abs(u_vel))) * 0.001;\n"
+	"    vec2 a = (v_uv - u_blur.xy) / sv;\n"
+	"    vec2 b = (v_uv - u_blur.xy - u_blur.zw) / sv;\n"
+	"    float t_lo = max(max(min(a.x,b.x), min(a.y,b.y)), 0.0);\n"
+	"    float t_hi = min(min(max(a.x,b.x), max(a.y,b.y)), 1.0);\n"
+	"    float coverage = max(0.0, t_hi - t_lo);\n"
+	"    vec2 cuv = (v_uv - u_blur.xy - u_vel * (t_lo + t_hi) * 0.5) / u_blur.zw;\n"
+	"    gl_FragColor = texture2D(u_tex, clamp(cuv, 0.0, 1.0)) * coverage;\n"
+	"}\n";
+
 /* ========================================================================== */
 /* Utility                                                                     */
 /* ========================================================================== */
 
-static const char *get_title(struct view *view) {
-	static char buf[256];
-	const char *title = view->xdg_toplevel->title ? view->xdg_toplevel->title : "";
-	snprintf(buf, sizeof(buf), "%s [%d]", title, view->pid);
-	return buf;
+static void update_title(struct view *view) {
+	const char *t = view->xdg_toplevel->title ? view->xdg_toplevel->title : "";
+	snprintf(view->title, sizeof(view->title), "%s [%d]", t, view->pid);
 }
 
 static inline struct wlr_surface *get_surface(struct view *view) {
@@ -543,8 +502,6 @@ static GLuint create_texture_nearest(void) {
 	glBindTexture(GL_TEXTURE_2D, tex);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	return tex;
 }
 
@@ -591,8 +548,8 @@ static void init_glyph_atlas(struct server *srv) {
 
 	srv->glyph_atlas = create_texture_nearest();
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, (GLsizei)atlas_w, (GLsizei)atlas_h, 0,
-		GL_ALPHA, GL_UNSIGNED_BYTE, pixels);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)atlas_w, (GLsizei)atlas_h, 0,
+		GL_RED, GL_UNSIGNED_BYTE, pixels);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 	free(pixels);
 
@@ -603,32 +560,6 @@ static void init_glyph_atlas(struct server *srv) {
 	srv->ft_library = NULL;
 }
 
-static void init_cursor_texture(struct server *srv) {
-	if (srv->cursor_texture) return;
-
-	/* 16x16 triangle cursor: white fill, black outline */
-	static const uint32_t cursor_data[16 * 16] = {
-		0xff000000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xff000000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xff000000,0xff000000,0xff000000,0xff000000,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xffffffff,0xff000000,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,0,
-		0xff000000,0xffffffff,0xff000000,0,0xff000000,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,
-		0xff000000,0xff000000,0,0,0xff000000,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,
-		0xff000000,0,0,0,0,0xff000000,0xffffffff,0xffffffff,0xff000000,0,0,0,0,0,0,0,
-		0,0,0,0,0,0xff000000,0xffffffff,0xff000000,0,0,0,0,0,0,0,0,
-		0,0,0,0,0,0,0xff000000,0xff000000,0,0,0,0,0,0,0,0,
-	};
-
-	srv->cursor_texture = create_texture_nearest();
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, cursor_data);
-}
 
 /* ========================================================================== */
 /* Shader helpers                                                              */
@@ -682,27 +613,26 @@ static GLuint create_program(const char *vert_src, const char *frag_src,
 
 static void init_background_shader(struct server *srv) {
 	const char *attribs[] = { "a_pos" };
-	srv->bg_shader_program = create_program(quad_vertex_shader_src, bg_fragment_shader_src, attribs, 1);
-	if (!srv->bg_shader_program) return;
+	srv->bg_prog = create_program(quad_vertex_shader_src, bg_fragment_shader_src, attribs, 1);
+	if (!srv->bg_prog) return;
 
-	srv->bg_time_loc = glGetUniformLocation(srv->bg_shader_program, "u_time");
-	srv->bg_resolution_loc = glGetUniformLocation(srv->bg_shader_program, "u_resolution");
+	srv->bg_time_loc = glGetUniformLocation(srv->bg_prog, "u_time");
+	srv->bg_resolution_loc = glGetUniformLocation(srv->bg_prog, "u_resolution");
 
 	if (!srv->quad_vbo) {
-		float vertices[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+		static const float quad[] = { 0,0, 1,0, 0,1, 1,1 };
 		glGenBuffers(1, &srv->quad_vbo);
 		glBindBuffer(GL_ARRAY_BUFFER, srv->quad_vbo);
-		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &srv->start_time);
 }
 
 static void render_shader_background(struct server *srv, int width, int height) {
-	if (!srv->bg_shader_program) {
+	if (!srv->bg_prog) {
 		init_background_shader(srv);
-		if (!srv->bg_shader_program) return;
+		if (!srv->bg_prog) return;
 	}
 
 	float elapsed = fmodf((float)(srv->frame_time.tv_sec - srv->start_time.tv_sec) +
@@ -711,7 +641,7 @@ static void render_shader_background(struct server *srv, int width, int height) 
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_BLEND);
 	glViewport(0, 0, width, height);
-	glUseProgram(srv->bg_shader_program);
+	glUseProgram(srv->bg_prog);
 	glUniform1f(srv->bg_time_loc, elapsed);
 	glUniform2f(srv->bg_resolution_loc, (float)width, (float)height);
 
@@ -723,20 +653,20 @@ static void render_shader_background(struct server *srv, int width, int height) 
 
 static void init_night_shader(struct server *srv) {
 	const char *attribs[] = { "a_pos" };
-	srv->night_shader_program = create_program(quad_vertex_shader_src, night_fragment_shader_src, attribs, 1);
+	srv->night_prog = create_program(quad_vertex_shader_src, night_fragment_shader_src, attribs, 1);
 }
 
 static void render_night_filter(struct server *srv, int width, int height) {
 	if (!srv->night_mode) return;
-	if (!srv->night_shader_program) {
+	if (!srv->night_prog) {
 		init_night_shader(srv);
-		if (!srv->night_shader_program) return;
+		if (!srv->night_prog) return;
 	}
 
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_DST_COLOR, GL_ZERO);
 	glViewport(0, 0, width, height);
-	glUseProgram(srv->night_shader_program);
+	glUseProgram(srv->night_prog);
 
 	glBindBuffer(GL_ARRAY_BUFFER, srv->quad_vbo);
 	glEnableVertexAttribArray(0);
@@ -746,87 +676,95 @@ static void render_night_filter(struct server *srv, int width, int height) {
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
+static void init_blur_shader(struct server *srv) {
+	const char *attribs[] = { "a_pos" };
+	srv->blur_prog = create_program(blur_vertex_shader_src, blur_fragment_shader_src, attribs, 1);
+	srv->blur_rect_loc = glGetUniformLocation(srv->blur_prog, "u_rect");
+	srv->blur_resolution_loc = glGetUniformLocation(srv->blur_prog, "u_resolution");
+	srv->blur_blur_loc = glGetUniformLocation(srv->blur_prog, "u_blur");
+	srv->blur_vel_loc = glGetUniformLocation(srv->blur_prog, "u_vel");
+}
+
 static void init_ui_shader(struct server *srv) {
-	const char *attribs[] = {
-		"a_pos", "a_box", "a_face_color", "a_bevel_light",
-		"a_bevel_dark", "a_inner_shadow", "a_params"
-	};
-	srv->ui_shader_program = create_program(ui_vertex_shader_src, ui_fragment_shader_src, attribs, 7);
-	if (!srv->ui_shader_program) return;
+	const char *attribs[] = { "a_pos", "a_box", "a_face_color", "a_params" };
+	srv->ui_prog = create_program(ui_vertex_shader_src, ui_fragment_shader_src, attribs, 4);
+	if (!srv->ui_prog) return;
 
-	srv->ui_resolution_loc = glGetUniformLocation(srv->ui_shader_program, "u_resolution");
+	srv->res_loc = glGetUniformLocation(srv->ui_prog, "u_resolution");
 
-	srv->ui_ext_shader_program = create_program(ui_vertex_shader_src, ui_fragment_shader_external_src, attribs, 7);
-	if (srv->ui_ext_shader_program)
-		srv->ui_ext_resolution_loc = glGetUniformLocation(srv->ui_ext_shader_program, "u_resolution");
+	srv->ext_prog = create_program(ui_vertex_shader_src, ui_fragment_shader_external_src, attribs, 4);
+	if (srv->ext_prog)
+		srv->ext_res_loc = glGetUniformLocation(srv->ext_prog, "u_resolution");
 
-	glGenBuffers(1, &srv->ui_vbo);
+	/* Dynamic instance data - pre-allocate for max batch size */
+	glGenBuffers(1, &srv->inst_vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, srv->inst_vbo);
+	glBufferData(GL_ARRAY_BUFFER, UI_BATCH_MAX * sizeof(struct box_instance), NULL, GL_STREAM_DRAW);
 }
 
-static void flush_ui_boxes(struct server *srv) {
-	if (!srv->ui_batch_count) return;
-	glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(srv->ui_batch_count * 6 * sizeof(struct ui_vertex)),
-		srv->ui_batch, GL_STREAM_DRAW);
-	glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(srv->ui_batch_count * 6));
-	srv->ui_batch_count = 0;
+static void setup_ui_attributes(struct server *srv) {
+	for (GLuint i = 0; i < 4; i++) glEnableVertexAttribArray(i);
+
+	glBindBuffer(GL_ARRAY_BUFFER, srv->quad_vbo);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+	glVertexAttribDivisor(0, 0);
+
+	glBindBuffer(GL_ARRAY_BUFFER, srv->inst_vbo);
+	#define S sizeof(struct box_instance)
+	#define O(f) ((void *)offsetof(struct box_instance, f))
+	glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, S, O(box_xywh));
+	glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, S, O(data));
+	glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, S, O(params));
+	#undef O
+	#undef S
+	for (GLuint i = 1; i < 4; i++) glVertexAttribDivisor(i, 1);
 }
 
-static void begin_ui_pass(struct server *srv) {
-	if (!srv->ui_shader_program) {
-		init_ui_shader(srv);
-		if (!srv->ui_shader_program) return;
-	}
-	if (!srv->glyph_atlas)
-		init_glyph_atlas(srv);
-	srv->ui_batch_count = 0;
+static void flush_boxes(struct server *srv) {
+	if (!srv->batch_n) return;
 
-	int stride = sizeof(struct ui_vertex);
-	glUseProgram(srv->ui_shader_program);
-	glUniform2f(srv->ui_resolution_loc, (float)srv->current_output->width, (float)srv->current_output->height);
-	glBindBuffer(GL_ARRAY_BUFFER, srv->ui_vbo);
-	for (GLuint i = 0; i < 7; i++) glEnableVertexAttribArray(i);
-	#define OFF(field) ((void *)offsetof(struct ui_vertex, field))
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, OFF(pos));
-	glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, OFF(box_xywh));
-	glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, stride, OFF(face_color));
-	glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, OFF(bevel_light));
-	glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, OFF(bevel_dark));
-	glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, OFF(inner_shadow));
-	glVertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, stride, OFF(params));
-	#undef OFF
+	/* Upload instance data (buffer already allocated) */
+	glBindBuffer(GL_ARRAY_BUFFER, srv->inst_vbo);
+	glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(srv->batch_n * sizeof(struct box_instance)),
+		srv->batch);
 
-	if (srv->glyph_atlas) {
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, srv->glyph_atlas);
+	/* Draw all boxes with one instanced call */
+	glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)srv->batch_n);
+	srv->batch_n = 0;
+}
+
+static void queue_box(struct server *srv, int x, int y, int w, int h,
+		int style, const uint8_t *color, enum box_icon icon) {
+	if (srv->batch_n >= UI_BATCH_MAX)
+		flush_boxes(srv);
+
+	struct box_instance *inst = &srv->batch[srv->batch_n++];
+	inst->box_xywh[0] = (float)x;
+	inst->box_xywh[1] = (float)y;
+	inst->box_xywh[2] = (float)w;
+	inst->box_xywh[3] = (float)h;
+	inst->params[0] = (uint8_t)style;
+	inst->params[1] = (uint8_t)icon;
+	inst->params[2] = 0;
+	inst->params[3] = 0;
+	if (color) {
+		inst->data[0] = (float)color[0] / 255.0f;
+		inst->data[1] = (float)color[1] / 255.0f;
+		inst->data[2] = (float)color[2] / 255.0f;
+		inst->data[3] = (float)color[3] / 255.0f;
+	} else {
+		inst->data[0] = inst->data[1] = inst->data[2] = inst->data[3] = 0;
 	}
 }
 
-static void draw_ui_box(struct server *srv, int x, int y, int w, int h,
-		enum box_style style, const struct box_colors *colors,
-		enum box_icon icon, float icon_margin) {
-	if (srv->ui_batch_count >= UI_BATCH_MAX)
-		flush_ui_boxes(srv);
+static void draw_raised(struct server *srv, int x, int y, int w, int h,
+		const uint8_t *color, enum box_icon icon) {
+	queue_box(srv, x, y, w, h, STYLE_RAISED, color, icon);
+}
 
-	struct ui_vertex tmpl = {
-		.box_xywh = { (float)x, (float)y, (float)w, (float)h },
-		.params = { (float)style, (float)icon, icon_margin },
-	};
-	memcpy(tmpl.face_color, colors->face, sizeof(tmpl.face_color));
-	memcpy(tmpl.bevel_light, colors->bevel_light, sizeof(tmpl.bevel_light));
-	memcpy(tmpl.bevel_dark, colors->bevel_dark, sizeof(tmpl.bevel_dark));
-	memcpy(tmpl.inner_shadow, colors->inner_shadow, sizeof(tmpl.inner_shadow));
-
-	static const float corners[6][2] = {
-		{0, 0}, {1, 0}, {0, 1},
-		{1, 0}, {1, 1}, {0, 1},
-	};
-
-	size_t base = srv->ui_batch_count * 6;
-	for (size_t i = 0; i < 6; i++) {
-		srv->ui_batch[base + i] = tmpl;
-		memcpy(srv->ui_batch[base + i].pos, corners[i], sizeof(tmpl.pos));
-	}
-	srv->ui_batch_count++;
+static void draw_sunken(struct server *srv, int x, int y, int w, int h,
+		const uint8_t *color, enum box_icon icon) {
+	queue_box(srv, x, y, w, h, STYLE_SUNKEN, color, icon);
 }
 
 /* ========================================================================== */
@@ -847,14 +785,27 @@ static int measure_text(const struct server *srv, const char *text, int max_widt
 	return pen_x;
 }
 
-static int draw_text(struct server *srv, const char *text, int max_width,
-		float r, float g, float b, int x, int y) {
+static void draw_glyph(struct server *srv, int x, int y, int w, int h,
+		float u0, float v0, float u1, float v1) {
+	if (srv->batch_n >= UI_BATCH_MAX)
+		flush_boxes(srv);
+	struct box_instance *inst = &srv->batch[srv->batch_n++];
+	inst->box_xywh[0] = (float)x;
+	inst->box_xywh[1] = (float)y;
+	inst->box_xywh[2] = (float)w;
+	inst->box_xywh[3] = (float)h;
+	inst->data[0] = u0;
+	inst->data[1] = v0;
+	inst->data[2] = u1;
+	inst->data[3] = v1;
+	inst->params[0] = STYLE_GLYPH;
+	inst->params[1] = 0;
+	inst->params[2] = 0;
+	inst->params[3] = 0;
+}
+
+static int draw_text(struct server *srv, const char *text, int max_width, int x, int y) {
 	if (!srv->glyph_atlas || !text || !*text) return 0;
-	struct box_colors colors = {0};
-	colors.bevel_light[0] = r;
-	colors.bevel_light[1] = g;
-	colors.bevel_light[2] = b;
-	colors.bevel_light[3] = 1.0f;
 	int pen_x = 0;
 	for (const char *p = text; *p; p++) {
 		unsigned char c = (unsigned char)*p;
@@ -863,14 +814,9 @@ static int draw_text(struct server *srv, const char *text, int max_width,
 		if (!gi->advance) continue;
 		if (pen_x + gi->advance > max_width) break;
 		if (gi->width > 0 && gi->height > 0) {
-			colors.face[0] = gi->u0;
-			colors.face[1] = gi->v0;
-			colors.face[2] = gi->u1;
-			colors.face[3] = gi->v1;
-			draw_ui_box(srv, x + pen_x + gi->bearing_x,
+			draw_glyph(srv, x + pen_x + gi->bearing_x,
 				y + FONT_SIZE - gi->bearing_y,
-				gi->width, gi->height,
-				STYLE_GLYPH, &colors, ICON_NONE, 0);
+				gi->width, gi->height, gi->u0, gi->v0, gi->u1, gi->v1);
 		}
 		pen_x += gi->advance;
 	}
@@ -971,8 +917,8 @@ static void restore_geometry(struct view *view) {
 
 /* Get usable screen area (excluding taskbar) */
 static inline void get_usable_area(const struct server *srv, int *w, int *h) {
-	*w = srv->current_output->width;
-	*h = srv->current_output->height - BAR_HEIGHT;
+	*w = srv->output->width;
+	*h = srv->output->height - BAR_HEIGHT;
 }
 
 /* Position and size a view to fill a screen-space rectangle, subtracting
@@ -1067,12 +1013,12 @@ static int build_taskbar(struct server *srv, struct tb_btn *btns, int max_x) {
 	x += TB_START_W + TB_GAP;
 
 	btns[n++] = (struct tb_btn){ .x = x, .w = TB_WS_W, .type = TB_FIND,
-		.sunken = srv->find_window_open || (tb_pressed && srv->pressed.tb.type == TB_FIND) };
+		.sunken = srv->find_open || (tb_pressed && srv->pressed.tb.type == TB_FIND) };
 	x += TB_WS_W + TB_GAP;
 
 	for (uint8_t ws = 1; ws <= 9; ws++) {
 		btns[n++] = (struct tb_btn){ .x = x, .w = TB_WS_W, .type = TB_WORKSPACE, .workspace = ws,
-			.sunken = srv->current_workspace == ws ||
+			.sunken = srv->workspace == ws ||
 				(tb_pressed && srv->pressed.tb.type == TB_WORKSPACE && srv->pressed.tb.workspace == ws) };
 		x += TB_WS_W + TB_GAP;
 	}
@@ -1080,7 +1026,7 @@ static int build_taskbar(struct server *srv, struct tb_btn *btns, int max_x) {
 	struct view *view = NULL;
 	int win_limit = max_x - TB_WIN_W;
 	wl_list_for_each(view, &srv->taskbar_views, taskbar_link) {
-		if (view->workspace != srv->current_workspace) continue;
+		if (view->workspace != srv->workspace) continue;
 		if (n >= TB_BTN_MAX || x > win_limit) break;
 		btns[n++] = (struct tb_btn){ .x = x, .w = TB_WIN_W, .type = TB_WINDOW, .view = view,
 			.sunken = srv->focused_view == view ||
@@ -1093,7 +1039,7 @@ static int build_taskbar(struct server *srv, struct tb_btn *btns, int max_x) {
 
 static struct tb_btn *find_taskbar_hit(const struct server *srv, struct tb_btn *btns, int count,
 		double cx, double cy) {
-	int oh = srv->current_output->height;
+	int oh = srv->output->height;
 	int ty = oh - BAR_HEIGHT;
 	int bh = TB_BTN_HEIGHT;
 	int y_min = ty + TB_PADDING;
@@ -1141,15 +1087,15 @@ struct find_result {
 
 static struct find_result find_matching_windows(struct server *srv) {
 	struct find_result result = {0};
-	srv->find_window_query[srv->find_window_query_len] = '\0';
+	srv->find_query[srv->find_query_len] = '\0';
 
 	struct view *view = NULL;
 	wl_list_for_each(view, &srv->views, link) {
 		if (view->state == VIEW_MINIMIZED) continue;
-		const char *title = get_title(view);
-		if (!*title) continue;
+		if (!*view->title) continue;
+		const char *title = view->title;
 
-		if (!srv->find_window_query[0] || strcasestr(title, srv->find_window_query)) {
+		if (!srv->find_query[0] || strcasestr(title, srv->find_query)) {
 			if (result.count < MAX_FIND_VIEWS)
 				result.views[result.count++] = view;
 		}
@@ -1158,37 +1104,37 @@ static struct find_result find_matching_windows(struct server *srv) {
 }
 
 static void toggle_find_window(struct server *srv) {
-	srv->find_window_open = !srv->find_window_open;
-	if (srv->find_window_open) { srv->find_window_query_len = 0; srv->find_window_selected = 0; }
+	srv->find_open = !srv->find_open;
+	if (srv->find_open) { srv->find_query_len = 0; srv->find_selected = 0; }
 }
 
-static void activate_find_window_selection(struct server *srv) {
+static void activate_find_selection(struct server *srv) {
 	struct find_result matches = find_matching_windows(srv);
 	if (!matches.count) return;
 
-	size_t idx = srv->find_window_selected < matches.count ? srv->find_window_selected : matches.count - 1;
+	size_t idx = srv->find_selected < matches.count ? srv->find_selected : matches.count - 1;
 	struct view *view = matches.views[idx];
 
-	srv->current_workspace = view->workspace;
+	srv->workspace = view->workspace;
 	focus_view(view, get_surface(view));
-	srv->find_window_open = false;
+	srv->find_open = false;
 }
 
-static bool handle_find_window_key(struct server *srv, xkb_keysym_t sym, bool super_held) {
+static bool handle_find_key(struct server *srv, xkb_keysym_t sym, bool super_held) {
 	if (super_held) return false;
 
-	if (sym == XKB_KEY_Escape) { srv->find_window_open = false; return true; }
-	if (sym == XKB_KEY_Return) { activate_find_window_selection(srv); return true; }
-	if (sym == XKB_KEY_Up) { if (srv->find_window_selected > 0) srv->find_window_selected--; return true; }
-	if (sym == XKB_KEY_Down) { srv->find_window_selected++; return true; }
+	if (sym == XKB_KEY_Escape) { srv->find_open = false; return true; }
+	if (sym == XKB_KEY_Return) { activate_find_selection(srv); return true; }
+	if (sym == XKB_KEY_Up) { if (srv->find_selected > 0) srv->find_selected--; return true; }
+	if (sym == XKB_KEY_Down) { srv->find_selected++; return true; }
 	if (sym == XKB_KEY_BackSpace) {
-		if (srv->find_window_query_len > 0) { srv->find_window_query_len--; srv->find_window_selected = 0; }
+		if (srv->find_query_len > 0) { srv->find_query_len--; srv->find_selected = 0; }
 		return true;
 	}
 	if (sym >= 0x20 && sym <= 0x7e) {
-		if (srv->find_window_query_len < sizeof(srv->find_window_query)) {
-			srv->find_window_query[srv->find_window_query_len++] = (char)sym;
-			srv->find_window_selected = 0;
+		if (srv->find_query_len < sizeof(srv->find_query)) {
+			srv->find_query[srv->find_query_len++] = (char)sym;
+			srv->find_selected = 0;
 		}
 		return true;
 	}
@@ -1226,12 +1172,12 @@ static bool handle_keybinding(struct server *srv, xkb_keysym_t sym, bool super_h
 		if (shift_held) {
 			if (srv->focused_view) {
 				srv->focused_view->workspace = ws;
-				if (ws != srv->current_workspace)
+				if (ws != srv->workspace)
 					focus_top_view(srv);
 			}
 		} else {
-			srv->current_workspace = ws;
-			srv->find_window_open = false;
+			srv->workspace = ws;
+			srv->find_open = false;
 			focus_top_view(srv);
 		}
 		return true;
@@ -1375,9 +1321,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 			if (syms[i] == XKB_KEY_XF86MonBrightnessDown) { sysinfo_adjust_brightness(-1); handled = true; break; }
 			if (syms[i] == XKB_KEY_XF86MonBrightnessUp) { sysinfo_adjust_brightness(1); handled = true; break; }
 		}
-		if (!handled && srv->find_window_open) {
+		if (!handled && srv->find_open) {
 			for (int i = 0; i < nsyms; i++)
-				if (handle_find_window_key(srv, syms[i], super_held)) return;
+				if (handle_find_key(srv, syms[i], super_held)) return;
 		}
 		if (!handled) {
 			for (int i = 0; i < nsyms; i++) {
@@ -1388,7 +1334,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 	}
 
 	if (!handled) {
-		if (srv->find_window_open) return;
+		if (srv->find_open) return;
 		wlr_seat_keyboard_notify_key(srv->seat, event->time_msec, event->keycode, event->state);
 	}
 }
@@ -1480,17 +1426,6 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
 		/* Pointer is locked - don't move cursor, just send relative motion */
 	} else {
 		wlr_cursor_move(srv->cursor, &event->pointer->base, dx, dy);
-
-		/* Wrap cursor around screen edges */
-		int ow = srv->current_output->width, oh = srv->current_output->height;
-		double x = srv->cursor->x, y = srv->cursor->y;
-		bool wrapped = false;
-		if (x <= 0) { x = ow - 1; wrapped = true; }
-		else if (x >= ow - 1) { x = 0; wrapped = true; }
-		if (y <= 0) { y = oh - 1; wrapped = true; }
-		else if (y >= oh - 1) { y = 0; wrapped = true; }
-		if (wrapped) wlr_cursor_warp(srv->cursor, NULL, x, y);
-
 		process_cursor_motion(srv, event->time_msec);
 	}
 
@@ -1532,8 +1467,8 @@ static void handle_taskbar_release(struct server *srv, const struct tb_btn *hit)
 		break;
 	case TB_WORKSPACE:
 		if (hit->workspace == srv->pressed.tb.workspace) {
-			srv->current_workspace = hit->workspace;
-			srv->find_window_open = false;
+			srv->workspace = hit->workspace;
+			srv->find_open = false;
 			focus_top_view(srv);
 		}
 		break;
@@ -1584,7 +1519,7 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct wlr_pointer_button_event *event = data;
 
 	struct tb_btn tb_btns[TB_BTN_MAX];
-	int tb_count = build_taskbar(srv, tb_btns, srv->current_output->width);
+	int tb_count = build_taskbar(srv, tb_btns, srv->output->width);
 
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
 		if (srv->pressed.type == PRESSED_TITLE_BUTTON)
@@ -1686,77 +1621,85 @@ static void send_frame_done_iterator(struct wlr_surface *surface, int sx, int sy
 	wlr_surface_send_frame_done(surface, when);
 }
 
-static void render_surface_iterator(struct wlr_surface *surface, int sx, int sy, void *data) {
-	struct view *view = data;
-	struct server *srv = view->server;
+static void render_surface(struct server *srv, struct view *view,
+		struct wlr_surface *surface, int sx, int sy) {
 	struct wlr_texture *texture = wlr_surface_get_texture(surface);
 	if (!texture) return;
 
 	struct wlr_gles2_texture_attribs attribs;
 	wlr_gles2_texture_get_attribs(texture, &attribs);
 
+	bool external = attribs.target == GL_TEXTURE_EXTERNAL_OES;
+	GLuint program = external ? srv->ext_prog : srv->ui_prog;
+	GLint res_loc = external ? srv->ext_res_loc : srv->res_loc;
+
+	glUseProgram(program);
+	glUniform2f(res_loc, (float)srv->output->width, (float)srv->output->height);
+
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(attribs.target, attribs.tex);
-	glTexParameteri(attribs.target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(attribs.target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-	bool external = attribs.target == GL_TEXTURE_EXTERNAL_OES;
-	if (external && srv->ui_ext_shader_program) {
-		glUseProgram(srv->ui_ext_shader_program);
-		glUniform2f(srv->ui_ext_resolution_loc,
-			(float)srv->current_output->width, (float)srv->current_output->height);
-	}
+	glTexParameteri(attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
 	struct wlr_box geo = get_geometry(view);
 	int cx, cy;
 	get_content_pos(view, &cx, &cy);
 	int dx = cx + sx - geo.x;
 	int dy = cy + sy - geo.y;
-	draw_ui_box(srv, dx, dy, surface->current.width, surface->current.height,
-		STYLE_TEXTURED, &no_colors, ICON_NONE, 0);
-	flush_ui_boxes(srv);
 
-	if (external) {
-		glUseProgram(srv->ui_shader_program);
-		glUniform2f(srv->ui_resolution_loc,
-			(float)srv->current_output->width, (float)srv->current_output->height);
-	}
+	queue_box(srv, dx, dy, surface->current.width, surface->current.height,
+		STYLE_TEXTURED, NULL, ICON_NONE);
+	flush_boxes(srv);
 
-	/* Rebind glyph atlas for subsequent UI/text draws */
+	/* Restore UI state for subsequent draws */
+	glUseProgram(srv->ui_prog);
+	glUniform2f(srv->res_loc, (float)srv->output->width, (float)srv->output->height);
 	if (srv->glyph_atlas)
 		glBindTexture(GL_TEXTURE_2D, srv->glyph_atlas);
+}
+
+struct surface_render_data { struct view *view; };
+
+static void render_surface_iterator(struct wlr_surface *surface, int sx, int sy, void *data) {
+	struct surface_render_data *rdata = data;
+	render_surface(rdata->view->server, rdata->view, surface, sx, sy);
 }
 
 static void render_window_frame(struct server *srv,
 		struct view *view, int cw, int ch, bool is_active) {
 	struct frame_insets fi = get_insets(view);
 	int frame_w = cw + fi.left + fi.right;
-	int frame_h = ch + fi.top + fi.bottom;
-	const struct box_colors *frame_colors = is_active ? &win95_frame_active_colors : &win95_button_colors;
+	const uint8_t *color = is_active ? COLOR_FRAME_ACTIVE : COLOR_BUTTON;
 
 	struct title_buttons tb = get_buttons(view, cw);
 	const enum box_icon icons[] = { ICON_MINIMIZE, ICON_MAXIMIZE, ICON_CLOSE };
 
-	draw_ui_box(srv, view->x, view->y, frame_w, frame_h, STYLE_RAISED, frame_colors, ICON_NONE, 0);
+	/* Draw frame borders only, not behind content */
+	draw_raised(srv, view->x, view->y, frame_w, fi.top, color, ICON_NONE);
+	draw_raised(srv, view->x, view->y + fi.top, fi.left, ch, color, ICON_NONE);
+	draw_raised(srv, view->x + fi.left + cw, view->y + fi.top, fi.right, ch, color, ICON_NONE);
+	draw_raised(srv, view->x, view->y + fi.top + ch, frame_w, fi.bottom, color, ICON_NONE);
+
 	for (int i = 0; i < 3; i++) {
 		bool pressed = srv->pressed.type == PRESSED_TITLE_BUTTON && srv->pressed.title.view == view && srv->pressed.title.button == icons[i];
-		draw_ui_box(srv, tb.x[i], tb.y, tb.size, tb.size,
-			pressed ? STYLE_SUNKEN : STYLE_RAISED, frame_colors, icons[i], 4.0f);
+		if (pressed)
+			draw_sunken(srv, tb.x[i], tb.y, tb.size, tb.size, color, icons[i]);
+		else
+			draw_raised(srv, tb.x[i], tb.y, tb.size, tb.size, color, icons[i]);
 	}
 
-	const char *title = get_title(view);
-	if (*title) {
+	if (*view->title) {
 		int max_tw = cw - (tb.size + 2) * 3 - 2 - 8;
 		if (max_tw < 1) return;
 		int title_h = fi.top - BAR_PADDING * 2;
 		int text_h = FONT_SIZE + 4;
-		draw_text(srv, title, max_tw, 0, 0, 0,
+		draw_text(srv, view->title, max_tw,
 			view->x + fi.left + 4, view->y + BAR_PADDING + (title_h - text_h) / 2);
 	}
 }
 
 static void render_taskbar(struct server *srv) {
-	int ow = srv->current_output->width, oh = srv->current_output->height;
+	int ow = srv->output->width, oh = srv->output->height;
 	int ty = oh - BAR_HEIGHT;
 	int bh = TB_BTN_HEIGHT;
 	int text_h = FONT_SIZE + 4;
@@ -1765,10 +1708,12 @@ static void render_taskbar(struct server *srv) {
 	struct tb_btn btns[TB_BTN_MAX];
 	int count = build_taskbar(srv, btns, ow);
 
-	draw_ui_box(srv, 0, ty, ow, BAR_HEIGHT, STYLE_RAISED, &win95_taskbar_colors, ICON_NONE, 0);
+	draw_raised(srv, 0, ty, ow, BAR_HEIGHT, COLOR_BUTTON, ICON_NONE);
 	for (int i = 0; i < count; i++) {
-		draw_ui_box(srv, btns[i].x, ty + TB_PADDING, btns[i].w, bh,
-			btns[i].sunken ? STYLE_SUNKEN : STYLE_RAISED, &win95_button_colors, ICON_NONE, 0);
+		if (btns[i].sunken)
+			draw_sunken(srv, btns[i].x, ty + TB_PADDING, btns[i].w, bh, COLOR_BUTTON, ICON_NONE);
+		else
+			draw_raised(srv, btns[i].x, ty + TB_PADDING, btns[i].w, bh, COLOR_BUTTON, ICON_NONE);
 		const char *label = NULL;
 		char ws_str[2];
 		int max_w = btns[i].w - 8;
@@ -1777,12 +1722,11 @@ static void render_taskbar(struct server *srv) {
 		case TB_START:     label = "Start"; break;
 		case TB_FIND:      label = "?"; break;
 		case TB_WORKSPACE: ws_str[0] = (char)('0' + btns[i].workspace); ws_str[1] = 0; label = ws_str; break;
-		case TB_WINDOW:    label = get_title(btns[i].view); break;
+		case TB_WINDOW:    label = btns[i].view->title; break;
 		}
 		if (label && *label && max_w > 0) {
 			int tw = measure_text(srv, label, max_w);
-			draw_text(srv, label, max_w, 0, 0, 0,
-				btns[i].x + (btns[i].w - tw) / 2, text_y);
+			draw_text(srv, label, max_w, btns[i].x + (btns[i].w - tw) / 2, text_y);
 		}
 	}
 
@@ -1796,9 +1740,8 @@ static void render_taskbar(struct server *srv) {
 		int status_w = measure_text(srv, status, 400);
 		int status_pad = 8;
 		int status_x = ow - status_w - status_pad;
-		draw_ui_box(srv, status_x - 4, ty + TB_PADDING, status_w + 8, bh,
-			STYLE_SUNKEN, &win95_button_colors, ICON_NONE, 0);
-		draw_text(srv, status, 400, 0, 0, 0, status_x, ty + TB_PADDING + (bh - text_h) / 2);
+		draw_sunken(srv, status_x - 4, ty + TB_PADDING, status_w + 8, bh, COLOR_BUTTON, ICON_NONE);
+		draw_text(srv, status, 400, status_x, ty + TB_PADDING + (bh - text_h) / 2);
 	}
 }
 
@@ -1831,61 +1774,43 @@ static struct dialog_layout calc_dialog_layout(int screen_w, int screen_h, size_
 	};
 }
 
-static void render_find_window_overlay(struct server *srv) {
-	if (!srv->find_window_open) return;
+static void render_find_overlay(struct server *srv) {
+	if (!srv->find_open) return;
 
 	struct find_result matches = find_matching_windows(srv);
 	size_t visible = matches.count < 8 ? matches.count : 8;
 
-	if (matches.count > 0 && srv->find_window_selected >= matches.count)
-		srv->find_window_selected = matches.count - 1;
+	if (matches.count > 0 && srv->find_selected >= matches.count)
+		srv->find_selected = matches.count - 1;
 	if (matches.count == 0)
-		srv->find_window_selected = 0;
+		srv->find_selected = 0;
 
 	struct dialog_layout l = calc_dialog_layout(
-		srv->current_output->width, srv->current_output->height, visible);
+		srv->output->width, srv->output->height, visible);
 
-	draw_ui_box(srv, l.x, l.y, l.w, l.h, STYLE_RAISED, &win95_button_colors, ICON_NONE, 0);
-	draw_ui_box(srv, l.content_x, l.input_y, l.content_w, l.input_h, STYLE_SUNKEN, &win95_button_colors, ICON_NONE, 0);
+	draw_raised(srv, l.x, l.y, l.w, l.h, COLOR_BUTTON, ICON_NONE);
+	draw_sunken(srv, l.content_x, l.input_y, l.content_w, l.input_h, COLOR_BUTTON, ICON_NONE);
 
 	char buf[132];
-	memcpy(buf, srv->find_window_query, srv->find_window_query_len);
-	buf[srv->find_window_query_len] = '|';
-	buf[srv->find_window_query_len + 1] = '\0';
-	draw_text(srv, buf, l.content_w - 8, 0, 0, 0,
-		l.content_x + 4, l.input_y + (l.input_h - FONT_SIZE - 4) / 2);
+	memcpy(buf, srv->find_query, srv->find_query_len);
+	buf[srv->find_query_len] = '|';
+	buf[srv->find_query_len + 1] = '\0';
+	draw_text(srv, buf, l.content_w - 8, l.content_x + 4, l.input_y + (l.input_h - FONT_SIZE - 4) / 2);
 
 	for (size_t i = 0; i < visible; i++) {
 		int iy = l.list_y + (int)i * l.item_stride;
-		bool selected = (i == srv->find_window_selected);
-		draw_ui_box(srv, l.content_x, iy, l.content_w, l.item_h,
-			selected ? STYLE_SUNKEN : STYLE_RAISED, &win95_button_colors, ICON_NONE, 0);
-		draw_text(srv, get_title(matches.views[i]), l.content_w - 8, 0, 0, 0,
-			l.content_x + 4, iy + l.text_inset);
+		bool selected = (i == srv->find_selected);
+		if (selected)
+			draw_sunken(srv, l.content_x, iy, l.content_w, l.item_h, COLOR_BUTTON, ICON_NONE);
+		else
+			draw_raised(srv, l.content_x, iy, l.content_w, l.item_h, COLOR_BUTTON, ICON_NONE);
+		draw_text(srv, matches.views[i]->title, l.content_w - 8, l.content_x + 4, iy + l.text_inset);
 	}
 
-	if (matches.count == 0 && srv->find_window_query_len > 0)
-		draw_text(srv, "No windows found", l.content_w - 8, 0.5f, 0.5f, 0.5f,
-			l.content_x + 4, l.list_y + l.text_inset);
+	if (matches.count == 0 && srv->find_query_len > 0)
+		draw_text(srv, "No windows found", l.content_w - 8, l.content_x + 4, l.list_y + l.text_inset);
 }
 
-static void render_cursor(struct server *srv) {
-	if (!srv->cursor_texture) {
-		init_cursor_texture(srv);
-		if (!srv->cursor_texture) return;
-	}
-
-	flush_ui_boxes(srv);
-	glBindTexture(GL_TEXTURE_2D, srv->cursor_texture);
-
-	int cx = (int)srv->cursor->x;
-	int cy = (int)srv->cursor->y;
-
-	draw_ui_box(srv, cx, cy, 16, 16, STYLE_TEXTURED, &no_colors, ICON_NONE, 0.0f);
-
-	flush_ui_boxes(srv);
-	glBindTexture(GL_TEXTURE_2D, srv->glyph_atlas);
-}
 
 /* ========================================================================== */
 /* Output                                                                      */
@@ -1904,11 +1829,60 @@ static void update_geometry(struct view *view) {
 
 static void render_view(struct server *srv, struct view *view) {
 	update_geometry(view);
-	if (view->frame_h > view->content_h)
+	if (view->frame_h > view->content_h) {
 		render_window_frame(srv, view, view->content_w, view->content_h, srv->focused_view == view);
-	flush_ui_boxes(srv);
+		flush_boxes(srv);
+	}
+	struct surface_render_data rdata = { .view = view };
 	wlr_xdg_surface_for_each_surface(view->xdg_toplevel->base,
-		render_surface_iterator, view);
+		render_surface_iterator, &rdata);
+}
+
+static void render_cursor_trail(struct server *srv, struct wlr_output *wlr_output) {
+	double cx = srv->cursor->x;
+	double cy = srv->cursor->y;
+	double vx = cx - srv->prev_cursor_x;
+	double vy = cy - srv->prev_cursor_y;
+	srv->prev_cursor_x = cx;
+	srv->prev_cursor_y = cy;
+
+	struct wlr_output_cursor *ocursor;
+	wl_list_for_each(ocursor, &wlr_output->cursors, link) {
+		if (!ocursor->enabled || !ocursor->visible || !ocursor->texture)
+			continue;
+
+		struct wlr_gles2_texture_attribs attribs;
+		wlr_gles2_texture_get_attribs(ocursor->texture, &attribs);
+
+		double abs_vx = vx < 0 ? -vx : vx;
+		double abs_vy = vy < 0 ? -vy : vy;
+		double cw = ocursor->width, ch = ocursor->height;
+		double bw = cw + abs_vx;
+		double bh = ch + abs_vy;
+		float bx = (float)(cx - ocursor->hotspot_x - (vx > 0 ? vx : 0));
+		float by = (float)(cy - ocursor->hotspot_y - (vy > 0 ? vy : 0));
+
+		if (!srv->blur_prog) init_blur_shader(srv);
+		glUseProgram(srv->blur_prog);
+		glBindBuffer(GL_ARRAY_BUFFER, srv->quad_vbo);
+		glEnableVertexAttribArray(0);
+		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(attribs.target, attribs.tex);
+
+		glUniform4f(srv->blur_rect_loc, bx, by, (float)bw, (float)bh);
+		glUniform2f(srv->blur_resolution_loc, (float)wlr_output->width, (float)wlr_output->height);
+		glUniform4f(srv->blur_blur_loc,
+			(float)((vx < 0 ? abs_vx : 0) / bw),
+			(float)((vy < 0 ? abs_vy : 0) / bh),
+			(float)(cw / bw), (float)(ch / bh));
+		glUniform2f(srv->blur_vel_loc, (float)(vx / bw), (float)(vy / bh));
+
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glDisableVertexAttribArray(0);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+	}
 }
 
 static void output_frame(struct wl_listener *listener, void *data) {
@@ -1928,13 +1902,35 @@ static void output_frame(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	srv->current_output = wlr_output;
+	srv->output = wlr_output;
 
 	render_shader_background(srv, wlr_output->width, wlr_output->height);
 
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-	begin_ui_pass(srv);
+
+	/* Setup UI rendering state */
+	if (!srv->ui_prog) {
+		init_ui_shader(srv);
+		if (!srv->ui_prog) {
+			wlr_render_pass_submit(pass);
+			wlr_output_commit_state(wlr_output, &state);
+			wlr_output_state_finish(&state);
+			return;
+		}
+	}
+	if (!srv->glyph_atlas)
+		init_glyph_atlas(srv);
+	srv->batch_n = 0;
+
+	glUseProgram(srv->ui_prog);
+	glUniform2f(srv->res_loc, (float)wlr_output->width, (float)wlr_output->height);
+	setup_ui_attributes(srv);
+
+	if (srv->glyph_atlas) {
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, srv->glyph_atlas);
+	}
 
 	struct view *view = NULL;
 	for_each_visible_view_reverse(view, srv) {
@@ -1944,18 +1940,15 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
 	if (!srv->focused_view || srv->focused_view->state != VIEW_FULLSCREEN)
 		render_taskbar(srv);
-	render_find_window_overlay(srv);
-	render_cursor(srv);
+	render_find_overlay(srv);
 
-	flush_ui_boxes(srv);
-	for (GLuint i = 0; i < 7; i++) glDisableVertexAttribArray(i);
-	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	flush_boxes(srv);
+	render_cursor_trail(srv, wlr_output);
+	for (GLuint i = 0; i < 4; i++) glDisableVertexAttribArray(i);
 	render_night_filter(srv, wlr_output->width, wlr_output->height);
 	wlr_render_pass_submit(pass);
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
-
-	/* Keep rendering while any view has active animation */
 	wlr_output_schedule_frame(wlr_output);
 }
 
@@ -1971,7 +1964,7 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	wlr_output_commit_state(wlr_output, event->state);
 
 	if (wlr_output->width != old_w || wlr_output->height != old_h) {
-		srv->current_output = wlr_output;
+		srv->output = wlr_output;
 
 		int uw, uh;
 		get_usable_area(srv, &uw, &uh);
@@ -2035,7 +2028,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 
 	wl_list_insert(&srv->outputs, &output->link);
 	wlr_output_layout_add_auto(srv->output_layout, wlr_output);
-	srv->current_output = wlr_output;
+	srv->output = wlr_output;
 }
 
 /* ========================================================================== */
@@ -2048,13 +2041,14 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	set_view_state(view, VIEW_NORMAL);
 	struct wl_client *client = wl_resource_get_client(get_surface(view)->resource);
 	if (client) wl_client_get_credentials(client, &view->pid, NULL, NULL);
+	update_title(view);
 
 	/* Center the window on the output */
 	const struct server *srv = view->server;
 	int frame_w, frame_h;
 	get_frame_size(view, &frame_w, &frame_h);
-	view->x = (srv->current_output->width - frame_w) / 2;
-	view->y = (srv->current_output->height - frame_h) / 2;
+	view->x = (srv->output->width - frame_w) / 2;
+	view->y = (srv->output->height - frame_h) / 2;
 
 	wl_list_insert(&view->server->views, &view->link);
 	wl_list_insert(view->server->taskbar_views.prev, &view->taskbar_link);
@@ -2154,7 +2148,7 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	view->xdg_toplevel = toplevel;
 	view->x = 50;
 	view->y = 50;
-	view->workspace = srv->current_workspace;
+	view->workspace = srv->workspace;
 
 	xdg_surface->data = view;
 	wl_list_init(&view->decoration_destroy.link);
@@ -2211,7 +2205,7 @@ int main(void) {
 
 	server.wl_display = wl_display_create();
 	if (!server.wl_display) return 1;
-	server.current_workspace = 1;
+	server.workspace = 1;
 
 	server.backend = wlr_backend_autocreate(wl_display_get_event_loop(server.wl_display), NULL);
 	if (!server.backend) return 1;
@@ -2277,6 +2271,11 @@ int main(void) {
 	server.cursor = wlr_cursor_create();
 	if (!server.cursor) return 1;
 	wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
+
+	server.xcursor_manager = wlr_xcursor_manager_create(NULL, 24);
+	wlr_xcursor_manager_load(server.xcursor_manager, 1);
+	wlr_cursor_set_xcursor(server.cursor, server.xcursor_manager, "default");
+
 	LISTEN(&server.cursor_motion, server_cursor_motion, &server.cursor->events.motion);
 	LISTEN(&server.cursor_motion_absolute, server_cursor_motion_absolute, &server.cursor->events.motion_absolute);
 	LISTEN(&server.cursor_button, server_cursor_button, &server.cursor->events.button);
@@ -2304,11 +2303,11 @@ int main(void) {
 	}
 
 	setenv("WAYLAND_DISPLAY", socket, 1);
-	system("dbus-update-activation-environment WAYLAND_DISPLAY"); // so D-Bus activated apps connect to this compositor
 
 	wl_display_run(server.wl_display);
 
 	wl_display_destroy_clients(server.wl_display);
+	wlr_xcursor_manager_destroy(server.xcursor_manager);
 	wlr_cursor_destroy(server.cursor);
 	wlr_allocator_destroy(server.allocator);
 	wlr_renderer_destroy(server.renderer);
