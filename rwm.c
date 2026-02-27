@@ -6,6 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <signal.h>
+#include <systemd/sd-bus.h>
 
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
@@ -61,21 +62,12 @@
 
 #define UI_BATCH_MAX    512
 #define MAX_FIND_VIEWS  32
+#define NOTIF_WIDTH     300
+#define NOTIF_HEIGHT    60
+#define NOTIF_PADDING   10
+#define NOTIF_GAP       8
+#define MAX_NOTIFS      10
 
-#define LISTEN(listener, handler, signal) \
-	do { (listener)->notify = (handler); wl_signal_add((signal), (listener)); } while(0)
-
-#define view_is_visible(view, srv) \
-	((view)->workspace == (srv)->workspace && \
-	 (view)->state != VIEW_MINIMIZED)
-
-#define for_each_visible_view(view, srv) \
-	wl_list_for_each(view, &(srv)->views, link) \
-		if (view_is_visible(view, srv))
-
-#define for_each_visible_view_reverse(view, srv) \
-	wl_list_for_each_reverse(view, &(srv)->views, link) \
-		if (view_is_visible(view, srv))
 
 /* ========================================================================== */
 /* Enums                                                                       */
@@ -188,6 +180,13 @@ struct pressed_state {
 	};
 };
 
+struct notification {
+	uint32_t id;
+	char summary[128];
+	char body[256];
+	struct wl_list link;
+};
+
 struct server {
 	struct wl_display *wl_display;
 	struct wlr_backend *backend;
@@ -199,6 +198,8 @@ struct server {
 	GLuint bg_prog;
 	GLint bg_time_loc;
 	GLint bg_resolution_loc;
+	GLint bg_noise_offset_loc;
+	GLuint bg_noise_tex;
 	struct timespec start_time;
 
 	/* UI box shader (instanced) */
@@ -223,6 +224,7 @@ struct server {
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
+	struct wl_listener new_decoration;
 
 	uint8_t workspace;
 	struct view *focused_view;
@@ -248,6 +250,7 @@ struct server {
 	struct wl_list keyboards;
 
 	struct wl_listener new_output;
+	struct wl_listener backend_destroy;
 	struct wl_list outputs;
 	struct wl_list views;
 	struct wl_list taskbar_views;
@@ -276,13 +279,18 @@ struct server {
 	/* Cached frame time */
 	struct timespec frame_time;
 
-	/* Cached sysinfo (updated once per second) */
+	/* Cached sysinfo (updated by background thread) */
 	struct sysinfo cached_sysinfo;
-	time_t last_sysinfo_update;
 
 	/* Night mode (blue light filter) */
 	bool night_mode;
 	GLuint night_prog;
+
+	/* Notifications */
+	sd_bus *notify_bus;
+	struct wl_event_source *notify_event;
+	struct wl_list notifications;
+	uint32_t next_notif_id;
 };
 
 /* ========================================================================== */
@@ -291,6 +299,20 @@ struct server {
 
 static const uint8_t COLOR_BUTTON[4]       = {191, 191, 191, 255};
 static const uint8_t COLOR_FRAME_ACTIVE[4] = {166, 166, 217, 255};
+
+/* Forward declarations */
+static struct notification *notification_at(struct server *srv, double cx, double cy);
+
+static inline void listen(struct wl_listener *listener,
+		wl_notify_func_t handler, struct wl_signal *signal) {
+	if (!listener || !signal) return;
+	listener->notify = handler;
+	wl_signal_add(signal, listener);
+}
+
+static inline bool view_is_visible(const struct view *view, const struct server *srv) {
+	return view->workspace == srv->workspace && view->state != VIEW_MINIMIZED;
+}
 
 /* ========================================================================== */
 /* Global server instance                                                      */
@@ -306,6 +328,8 @@ static const char bg_fragment_shader_src[] =
 	"precision highp float;\n"
 	"uniform float u_time;\n"
 	"uniform vec2 u_resolution;\n"
+	"uniform vec2 u_noise_offset;\n"
+	"uniform sampler2D u_noise;\n"
 	"\n"
 	"void main() {\n"
 	"    vec2 uv = gl_FragCoord.xy / u_resolution;\n"
@@ -322,7 +346,10 @@ static const char bg_fragment_shader_src[] =
 	"    float g = 0.25 + 0.25 * (v + 0.5);\n"
 	"    float b = 0.30 + 0.25 * (v + 0.5);\n"
 	"\n"
-	"    gl_FragColor = vec4(r, g, b, 1.0);\n"
+	"    vec3 n = texture2D(u_noise, gl_FragCoord.xy / 512.0 + u_noise_offset).rgb;\n"
+	"    vec3 dither = (n - 0.5) * (8.0 / 255.0);\n"
+	"\n"
+	"    gl_FragColor = vec4(vec3(r, g, b) + dither, 1.0);\n"
 	"}\n";
 
 static const char ui_vertex_shader_src[] =
@@ -611,6 +638,8 @@ static GLuint create_program(const char *vert_src, const char *frag_src,
 	return program;
 }
 
+#define BG_NOISE_SIZE 512
+
 static void init_background_shader(struct server *srv) {
 	const char *attribs[] = { "a_pos" };
 	srv->bg_prog = create_program(quad_vertex_shader_src, bg_fragment_shader_src, attribs, 1);
@@ -618,12 +647,32 @@ static void init_background_shader(struct server *srv) {
 
 	srv->bg_time_loc = glGetUniformLocation(srv->bg_prog, "u_time");
 	srv->bg_resolution_loc = glGetUniformLocation(srv->bg_prog, "u_resolution");
+	srv->bg_noise_offset_loc = glGetUniformLocation(srv->bg_prog, "u_noise_offset");
 
 	if (!srv->quad_vbo) {
 		static const float quad[] = { 0,0, 1,0, 0,1, 1,1 };
 		glGenBuffers(1, &srv->quad_vbo);
 		glBindBuffer(GL_ARRAY_BUFFER, srv->quad_vbo);
 		glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+	}
+
+	/* Generate triangular noise texture for dithering */
+	uint8_t *noise = malloc(BG_NOISE_SIZE * BG_NOISE_SIZE * 3);
+	if (noise) {
+		for (int i = 0; i < BG_NOISE_SIZE * BG_NOISE_SIZE * 3; i++) {
+			int r1 = rand() & 0xFF;
+			int r2 = rand() & 0xFF;
+			int tri = r1 - r2;
+			noise[i] = (uint8_t)(128 + tri / 2);
+		}
+		glGenTextures(1, &srv->bg_noise_tex);
+		glBindTexture(GL_TEXTURE_2D, srv->bg_noise_tex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, BG_NOISE_SIZE, BG_NOISE_SIZE, 0, GL_RGB, GL_UNSIGNED_BYTE, noise);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+		free(noise);
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &srv->start_time);
@@ -644,6 +693,11 @@ static void render_shader_background(struct server *srv, int width, int height) 
 	glUseProgram(srv->bg_prog);
 	glUniform1f(srv->bg_time_loc, elapsed);
 	glUniform2f(srv->bg_resolution_loc, (float)width, (float)height);
+	int rx = rand(), ry = rand();
+	glUniform2f(srv->bg_noise_offset_loc, (float)rx / (float)RAND_MAX, (float)ry / (float)RAND_MAX);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, srv->bg_noise_tex);
 
 	glBindBuffer(GL_ARRAY_BUFFER, srv->quad_vbo);
 	glEnableVertexAttribArray(0);
@@ -871,8 +925,9 @@ static void focus_view(struct view *view, struct wlr_surface *surface) {
 }
 
 static void focus_top_view(struct server *srv) {
-	struct view *next;
-	for_each_visible_view(next, srv) {
+	struct view *next = NULL;
+	wl_list_for_each(next, &srv->views, link) {
+		if (!view_is_visible(next, srv)) continue;
 		focus_view(next, get_surface(next));
 		return;
 	}
@@ -881,8 +936,9 @@ static void focus_top_view(struct server *srv) {
 }
 
 static void focus_last_window(struct server *srv) {
-	struct view *view;
-	for_each_visible_view(view, srv) {
+	struct view *view = NULL;
+	wl_list_for_each(view, &srv->views, link) {
+		if (!view_is_visible(view, srv)) continue;
 		if (view != srv->focused_view) {
 			focus_view(view, get_surface(view));
 			return;
@@ -975,7 +1031,8 @@ static void begin_grab(struct view *view, uint32_t edges) {
 static struct view *view_at(struct server *srv, double lx, double ly,
 		struct wlr_surface **out_surface, double *sx, double *sy) {
 	struct view *view = NULL;
-	for_each_visible_view(view, srv) {
+	wl_list_for_each(view, &srv->views, link) {
+		if (!view_is_visible(view, srv)) continue;
 		struct wlr_box geo = get_geometry(view);
 		int fw, fh, cx, cy;
 		get_frame_size(view, &fw, &fh);
@@ -1139,6 +1196,171 @@ static bool handle_find_key(struct server *srv, xkb_keysym_t sym, bool super_hel
 		return true;
 	}
 	return true; /* consume all other keys */
+}
+
+/* ========================================================================== */
+/* Notifications (D-Bus org.freedesktop.Notifications)                        */
+/* ========================================================================== */
+
+static struct notification *add_notification(struct server *srv,
+		const char *summary, const char *body) {
+	/* Limit notification count */
+	int count = 0;
+	struct notification *n = NULL;
+	wl_list_for_each(n, &srv->notifications, link) count++;
+	if (count >= MAX_NOTIFS) {
+		/* Remove oldest */
+		n = wl_container_of(srv->notifications.prev, n, link);
+		wl_list_remove(&n->link);
+		free(n);
+	}
+
+	struct notification *notif = calloc(1, sizeof(*notif));
+	if (!notif) return NULL;
+
+	notif->id = ++srv->next_notif_id;
+	snprintf(notif->summary, sizeof(notif->summary), "%s", summary ? summary : "");
+	snprintf(notif->body, sizeof(notif->body), "%s", body ? body : "");
+
+	wl_list_insert(&srv->notifications, &notif->link);
+	return notif;
+}
+
+static void close_notification(struct server *srv, uint32_t id) {
+	struct notification *n = NULL, *tmp = NULL;
+	wl_list_for_each_safe(n, tmp, &srv->notifications, link) {
+		if (n->id == id) {
+			wl_list_remove(&n->link);
+			free(n);
+			return;
+		}
+	}
+}
+
+static int handle_notify(sd_bus_message *m, void *userdata, sd_bus_error *err) {
+	struct server *srv = userdata;
+	(void)err;
+
+	const char *app_name, *icon, *summary, *body;
+	uint32_t replaces_id;
+	int32_t timeout;
+
+	int r = sd_bus_message_read(m, "susss", &app_name, &replaces_id, &icon, &summary, &body);
+	if (r < 0) return r;
+
+	/* Skip actions array */
+	r = sd_bus_message_skip(m, "as");
+	if (r < 0) return r;
+
+	/* Skip hints dict */
+	r = sd_bus_message_skip(m, "a{sv}");
+	if (r < 0) return r;
+
+	/* Read timeout */
+	r = sd_bus_message_read(m, "i", &timeout);
+	if (r < 0) return r;
+
+	struct notification *notif = NULL;
+	if (replaces_id > 0) {
+		/* Try to find and update existing notification */
+		wl_list_for_each(notif, &srv->notifications, link) {
+			if (notif->id == replaces_id) {
+				snprintf(notif->summary, sizeof(notif->summary), "%s", summary ? summary : "");
+				snprintf(notif->body, sizeof(notif->body), "%s", body ? body : "");
+				return sd_bus_reply_method_return(m, "u", replaces_id);
+			}
+		}
+	}
+
+	notif = add_notification(srv, summary, body);
+	if (!notif) return -ENOMEM;
+
+	return sd_bus_reply_method_return(m, "u", notif->id);
+}
+
+static int handle_close_notification(sd_bus_message *m, void *userdata, sd_bus_error *err) {
+	struct server *srv = userdata;
+	(void)err;
+	uint32_t id;
+	int r = sd_bus_message_read(m, "u", &id);
+	if (r < 0) return r;
+	close_notification(srv, id);
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int handle_get_capabilities(sd_bus_message *m, void *userdata, sd_bus_error *err) {
+	(void)userdata; (void)err;
+	return sd_bus_reply_method_return(m, "as", 1, "body");
+}
+
+static int handle_get_server_info(sd_bus_message *m, void *userdata, sd_bus_error *err) {
+	(void)userdata; (void)err;
+	return sd_bus_reply_method_return(m, "ssss", "rwm", "rwm", "1.0", "1.2");
+}
+
+static const sd_bus_vtable notif_vtable[] = {
+	SD_BUS_VTABLE_START(0),
+	SD_BUS_METHOD("Notify", "susssasa{sv}i", "u", handle_notify, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD("CloseNotification", "u", "", handle_close_notification, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD("GetCapabilities", "", "as", handle_get_capabilities, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD("GetServerInformation", "", "ssss", handle_get_server_info, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_SIGNAL("NotificationClosed", "uu", 0),
+	SD_BUS_SIGNAL("ActionInvoked", "us", 0),
+	SD_BUS_VTABLE_END
+};
+
+static int notify_bus_handler(int fd, uint32_t mask, void *data) {
+	struct server *srv = data;
+	(void)fd; (void)mask;
+	while (sd_bus_process(srv->notify_bus, NULL) > 0);
+	return 0;
+}
+
+static void init_notifications(struct server *srv) {
+	wl_list_init(&srv->notifications);
+	srv->next_notif_id = 0;
+
+	int r = sd_bus_open_user(&srv->notify_bus);
+	if (r < 0) {
+		fprintf(stderr, "Failed to open user bus: %s\n", strerror(-r));
+		return;
+	}
+
+	r = sd_bus_add_object_vtable(srv->notify_bus, NULL,
+		"/org/freedesktop/Notifications",
+		"org.freedesktop.Notifications",
+		notif_vtable, srv);
+	if (r < 0) {
+		fprintf(stderr, "Failed to add vtable: %s\n", strerror(-r));
+		sd_bus_unref(srv->notify_bus);
+		srv->notify_bus = NULL;
+		return;
+	}
+
+	r = sd_bus_request_name(srv->notify_bus, "org.freedesktop.Notifications", 0);
+	if (r < 0) {
+		fprintf(stderr, "Failed to acquire notification service name: %s\n", strerror(-r));
+		sd_bus_unref(srv->notify_bus);
+		srv->notify_bus = NULL;
+		return;
+	}
+
+	int fd = sd_bus_get_fd(srv->notify_bus);
+	struct wl_event_loop *loop = wl_display_get_event_loop(srv->wl_display);
+	srv->notify_event = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE,
+		notify_bus_handler, srv);
+}
+
+static void cleanup_notifications(struct server *srv) {
+	struct notification *n = NULL, *tmp = NULL;
+	wl_list_for_each_safe(n, tmp, &srv->notifications, link) {
+		wl_list_remove(&n->link);
+		free(n);
+	}
+	if (srv->notify_event)
+		wl_event_source_remove(srv->notify_event);
+	if (srv->notify_bus)
+		sd_bus_unref(srv->notify_bus);
 }
 
 /* ========================================================================== */
@@ -1365,9 +1587,9 @@ static void server_new_keyboard(struct server *srv, struct wlr_input_device *dev
 	xkb_context_unref(ctx);
 	wlr_keyboard_set_repeat_info(wlr_kb, 25, 600);
 
-	LISTEN(&kb->modifiers, keyboard_handle_modifiers, &wlr_kb->events.modifiers);
-	LISTEN(&kb->key, keyboard_handle_key, &wlr_kb->events.key);
-	LISTEN(&kb->destroy, keyboard_handle_destroy, &device->events.destroy);
+	listen(&kb->modifiers, keyboard_handle_modifiers, &wlr_kb->events.modifiers);
+	listen(&kb->key, keyboard_handle_key, &wlr_kb->events.key);
+	listen(&kb->destroy, keyboard_handle_destroy, &device->events.destroy);
 
 	wlr_seat_set_keyboard(srv->seat, wlr_kb);
 	wl_list_insert(&srv->keyboards, &kb->link);
@@ -1487,6 +1709,14 @@ static void handle_taskbar_release(struct server *srv, const struct tb_btn *hit)
 }
 
 static void handle_button_press(struct server *srv, struct tb_btn *tb_btns, int tb_count, uint32_t time, uint32_t button) {
+	/* Check for notification click first */
+	struct notification *notif = notification_at(srv, srv->cursor->x, srv->cursor->y);
+	if (notif) {
+		wl_list_remove(&notif->link);
+		free(notif);
+		return;
+	}
+
 	double sx = 0, sy = 0;
 	struct wlr_surface *surface = NULL;
 
@@ -1568,7 +1798,7 @@ static void handle_new_constraint(struct wl_listener *listener, void *data) {
 
 	srv->active_constraint = constraint;
 	wlr_pointer_constraint_v1_send_activated(constraint);
-	LISTEN(&srv->constraint_destroy, handle_constraint_destroy, &constraint->events.destroy);
+	listen(&srv->constraint_destroy, handle_constraint_destroy, &constraint->events.destroy);
 }
 
 /* ========================================================================== */
@@ -1730,11 +1960,8 @@ static void render_taskbar(struct server *srv) {
 		}
 	}
 
-	/* Status area on the right side (update once per second) */
-	if (srv->frame_time.tv_sec != srv->last_sysinfo_update) {
-		srv->last_sysinfo_update = srv->frame_time.tv_sec;
-		sysinfo_update(&srv->cached_sysinfo);
-	}
+	/* Status area on the right side (background thread updates values) */
+	sysinfo_get(&srv->cached_sysinfo);
 	const char *status = sysinfo_format_status(&srv->cached_sysinfo);
 	if (status[0]) {
 		int status_w = measure_text(srv, status, 400);
@@ -1811,6 +2038,46 @@ static void render_find_overlay(struct server *srv) {
 		draw_text(srv, "No windows found", l.content_w - 8, l.content_x + 4, l.list_y + l.text_inset);
 }
 
+static void render_notifications(struct server *srv) {
+	if (wl_list_empty(&srv->notifications)) return;
+
+	int x = srv->output->width - NOTIF_WIDTH - NOTIF_PADDING;
+	int y = NOTIF_PADDING;
+	int text_y_off = (NOTIF_HEIGHT / 2 - FONT_SIZE - 4) / 2;
+
+	struct notification *n = NULL;
+	wl_list_for_each(n, &srv->notifications, link) {
+		draw_raised(srv, x, y, NOTIF_WIDTH, NOTIF_HEIGHT, COLOR_BUTTON, ICON_NONE);
+
+		/* Summary (top half, bold would be nice but we only have one font) */
+		draw_text(srv, n->summary, NOTIF_WIDTH - 16, x + 8, y + text_y_off);
+
+		/* Body (bottom half) */
+		draw_text(srv, n->body, NOTIF_WIDTH - 16, x + 8, y + NOTIF_HEIGHT / 2 + text_y_off);
+
+		y += NOTIF_HEIGHT + NOTIF_GAP;
+		if ((unsigned)y + NOTIF_HEIGHT > (unsigned)srv->output->height) break;
+	}
+}
+
+static struct notification *notification_at(struct server *srv, double cx, double cy) {
+	if (wl_list_empty(&srv->notifications)) return NULL;
+
+	int x = srv->output->width - NOTIF_WIDTH - NOTIF_PADDING;
+	int y = NOTIF_PADDING;
+
+	struct notification *n = NULL;
+	wl_list_for_each(n, &srv->notifications, link) {
+		if (cx >= x && cx < x + NOTIF_WIDTH &&
+		    cy >= y && cy < y + NOTIF_HEIGHT) {
+			return n;
+		}
+		y += NOTIF_HEIGHT + NOTIF_GAP;
+		if ((unsigned)y + NOTIF_HEIGHT > (unsigned)srv->output->height) break;
+	}
+	return NULL;
+}
+
 
 /* ========================================================================== */
 /* Output                                                                      */
@@ -1870,6 +2137,8 @@ static void render_cursor_trail(struct server *srv, struct wlr_output *wlr_outpu
 
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(attribs.target, attribs.tex);
+		glTexParameteri(attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
 		glUniform4f(srv->blur_rect_loc, bx, by, (float)bw, (float)bh);
 		glUniform2f(srv->blur_resolution_loc, (float)wlr_output->width, (float)wlr_output->height);
@@ -1933,7 +2202,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	}
 
 	struct view *view = NULL;
-	for_each_visible_view_reverse(view, srv) {
+	wl_list_for_each_reverse(view, &srv->views, link) {
+		if (!view_is_visible(view, srv)) continue;
 		render_view(srv, view);
 		wlr_xdg_surface_for_each_surface(view->xdg_toplevel->base, send_frame_done_iterator, &srv->frame_time);
 	}
@@ -1941,6 +2211,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	if (!srv->focused_view || srv->focused_view->state != VIEW_FULLSCREEN)
 		render_taskbar(srv);
 	render_find_overlay(srv);
+	render_notifications(srv);
 
 	flush_boxes(srv);
 	render_cursor_trail(srv, wlr_output);
@@ -1982,12 +2253,21 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 
 static void output_destroy_handler(struct wl_listener *listener, void *data) {
 	struct output *output = wl_container_of(listener, output, destroy);
+	struct server *srv = output->server;
 	(void)data;
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
 	free(output);
+	if (wl_list_empty(&srv->outputs))
+		wl_display_terminate(srv->wl_display);
+}
+
+static void backend_destroy_handler(struct wl_listener *listener, void *data) {
+	struct server *srv = wl_container_of(listener, srv, backend_destroy);
+	(void)data;
+	wl_display_terminate(srv->wl_display);
 }
 
 static void server_new_output(struct wl_listener *listener, void *data) {
@@ -2022,9 +2302,9 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	output->wlr_output = wlr_output;
 	output->server = srv;
 
-	LISTEN(&output->frame, output_frame, &wlr_output->events.frame);
-	LISTEN(&output->request_state, output_request_state, &wlr_output->events.request_state);
-	LISTEN(&output->destroy, output_destroy_handler, &wlr_output->events.destroy);
+	listen(&output->frame, output_frame, &wlr_output->events.frame);
+	listen(&output->request_state, output_request_state, &wlr_output->events.request_state);
+	listen(&output->destroy, output_destroy_handler, &wlr_output->events.destroy);
 
 	wl_list_insert(&srv->outputs, &output->link);
 	wlr_output_layout_add_auto(srv->output_layout, wlr_output);
@@ -2134,7 +2414,7 @@ static void handle_new_decoration(struct wl_listener *listener, void *data) {
 	struct view *view = decoration->toplevel->base->data;
 	if (!view) return;
 	view->decoration = decoration;
-	LISTEN(&view->decoration_destroy, decoration_handle_destroy, &decoration->events.destroy);
+	listen(&view->decoration_destroy, decoration_handle_destroy, &decoration->events.destroy);
 }
 
 static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
@@ -2153,14 +2433,14 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	xdg_surface->data = view;
 	wl_list_init(&view->decoration_destroy.link);
 
-	LISTEN(&view->map, xdg_toplevel_map, &xdg_surface->surface->events.map);
-	LISTEN(&view->unmap, xdg_toplevel_unmap, &xdg_surface->surface->events.unmap);
-	LISTEN(&view->commit, xdg_toplevel_commit, &xdg_surface->surface->events.commit);
-	LISTEN(&view->destroy, xdg_toplevel_destroy, &toplevel->events.destroy);
-	LISTEN(&view->request_move, xdg_toplevel_request_move_handler, &toplevel->events.request_move);
-	LISTEN(&view->request_resize, xdg_toplevel_request_resize_handler, &toplevel->events.request_resize);
-	LISTEN(&view->request_maximize, xdg_toplevel_request_maximize_handler, &toplevel->events.request_maximize);
-	LISTEN(&view->request_fullscreen, xdg_toplevel_request_fullscreen_handler, &toplevel->events.request_fullscreen);
+	listen(&view->map, xdg_toplevel_map, &xdg_surface->surface->events.map);
+	listen(&view->unmap, xdg_toplevel_unmap, &xdg_surface->surface->events.unmap);
+	listen(&view->commit, xdg_toplevel_commit, &xdg_surface->surface->events.commit);
+	listen(&view->destroy, xdg_toplevel_destroy, &toplevel->events.destroy);
+	listen(&view->request_move, xdg_toplevel_request_move_handler, &toplevel->events.request_move);
+	listen(&view->request_resize, xdg_toplevel_request_resize_handler, &toplevel->events.request_resize);
+	listen(&view->request_maximize, xdg_toplevel_request_maximize_handler, &toplevel->events.request_maximize);
+	listen(&view->request_fullscreen, xdg_toplevel_request_fullscreen_handler, &toplevel->events.request_fullscreen);
 }
 
 struct popup_data {
@@ -2192,8 +2472,8 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	if (!pd) return;
 	pd->popup = popup;
 
-	LISTEN(&pd->commit, xdg_popup_commit, &popup->base->surface->events.commit);
-	LISTEN(&pd->destroy, xdg_popup_destroy, &popup->events.destroy);
+	listen(&pd->commit, xdg_popup_commit, &popup->base->surface->events.commit);
+	listen(&pd->destroy, xdg_popup_destroy, &popup->events.destroy);
 }
 
 /* ========================================================================== */
@@ -2243,27 +2523,27 @@ int main(void) {
 	server.relative_pointer_manager = wlr_relative_pointer_manager_v1_create(server.wl_display);
 	server.pointer_constraints = wlr_pointer_constraints_v1_create(server.wl_display);
 	wl_list_init(&server.constraint_destroy.link);
-	LISTEN(&server.new_constraint, handle_new_constraint, &server.pointer_constraints->events.new_constraint);
+	listen(&server.new_constraint, handle_new_constraint, &server.pointer_constraints->events.new_constraint);
 
 	server.output_layout = wlr_output_layout_create(server.wl_display);
 	if (!server.output_layout) return 1;
 	wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
 
 	wl_list_init(&server.outputs);
-	LISTEN(&server.new_output, server_new_output, &server.backend->events.new_output);
+	listen(&server.new_output, server_new_output, &server.backend->events.new_output);
+	listen(&server.backend_destroy, backend_destroy_handler, &server.backend->events.destroy);
 
 	wl_list_init(&server.views);
 	wl_list_init(&server.taskbar_views);
 	server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 6);
 	if (!server.xdg_shell) return 1;
-	LISTEN(&server.new_xdg_toplevel, server_new_xdg_toplevel, &server.xdg_shell->events.new_toplevel);
-	LISTEN(&server.new_xdg_popup, server_new_xdg_popup, &server.xdg_shell->events.new_popup);
+	listen(&server.new_xdg_toplevel, server_new_xdg_toplevel, &server.xdg_shell->events.new_toplevel);
+	listen(&server.new_xdg_popup, server_new_xdg_popup, &server.xdg_shell->events.new_popup);
 
 	struct wlr_xdg_decoration_manager_v1 *deco_mgr =
 		wlr_xdg_decoration_manager_v1_create(server.wl_display);
 	if (!deco_mgr) return 1;
-	static struct wl_listener new_deco = { .notify = handle_new_decoration };
-	wl_signal_add(&deco_mgr->events.new_toplevel_decoration, &new_deco);
+	listen(&server.new_decoration, handle_new_decoration, &deco_mgr->events.new_toplevel_decoration);
 
 	if (!getenv("XCURSOR_THEME")) setenv("XCURSOR_THEME", "default", 0);
 	if (!getenv("XCURSOR_SIZE")) setenv("XCURSOR_SIZE", "24", 0);
@@ -2276,19 +2556,21 @@ int main(void) {
 	wlr_xcursor_manager_load(server.xcursor_manager, 1);
 	wlr_cursor_set_xcursor(server.cursor, server.xcursor_manager, "default");
 
-	LISTEN(&server.cursor_motion, server_cursor_motion, &server.cursor->events.motion);
-	LISTEN(&server.cursor_motion_absolute, server_cursor_motion_absolute, &server.cursor->events.motion_absolute);
-	LISTEN(&server.cursor_button, server_cursor_button, &server.cursor->events.button);
-	LISTEN(&server.cursor_axis, server_cursor_axis, &server.cursor->events.axis);
-	LISTEN(&server.cursor_frame, server_cursor_frame, &server.cursor->events.frame);
+	listen(&server.cursor_motion, server_cursor_motion, &server.cursor->events.motion);
+	listen(&server.cursor_motion_absolute, server_cursor_motion_absolute, &server.cursor->events.motion_absolute);
+	listen(&server.cursor_button, server_cursor_button, &server.cursor->events.button);
+	listen(&server.cursor_axis, server_cursor_axis, &server.cursor->events.axis);
+	listen(&server.cursor_frame, server_cursor_frame, &server.cursor->events.frame);
 
 	wl_list_init(&server.keyboards);
-	LISTEN(&server.new_input, server_new_input, &server.backend->events.new_input);
+	listen(&server.new_input, server_new_input, &server.backend->events.new_input);
 
 	server.seat = wlr_seat_create(server.wl_display, "seat0");
 	if (!server.seat) return 1;
-	LISTEN(&server.request_cursor, seat_request_cursor, &server.seat->events.request_set_cursor);
-	LISTEN(&server.request_set_selection, seat_request_set_selection, &server.seat->events.request_set_selection);
+	listen(&server.request_cursor, seat_request_cursor, &server.seat->events.request_set_cursor);
+	listen(&server.request_set_selection, seat_request_set_selection, &server.seat->events.request_set_selection);
+
+	init_notifications(&server);
 
 	const char *socket = wl_display_add_socket_auto(server.wl_display);
 	if (!socket) {
@@ -2304,9 +2586,52 @@ int main(void) {
 
 	setenv("WAYLAND_DISPLAY", socket, 1);
 
+	/* Start sysinfo background thread */
+	sysinfo_start();
+
 	wl_display_run(server.wl_display);
 
+	/* Stop sysinfo background thread */
+	sysinfo_stop();
+
+	cleanup_notifications(&server);
+	wl_list_remove(&server.cursor_motion.link);
+	wl_list_remove(&server.cursor_motion_absolute.link);
+	wl_list_remove(&server.cursor_button.link);
+	wl_list_remove(&server.cursor_axis.link);
+	wl_list_remove(&server.cursor_frame.link);
+	wl_list_remove(&server.new_input.link);
+	wl_list_remove(&server.request_cursor.link);
+	wl_list_remove(&server.request_set_selection.link);
+	wl_list_remove(&server.new_output.link);
+	wl_list_remove(&server.backend_destroy.link);
+	wl_list_remove(&server.new_xdg_toplevel.link);
+	wl_list_remove(&server.new_xdg_popup.link);
+	wl_list_remove(&server.new_decoration.link);
+	wl_list_remove(&server.new_constraint.link);
 	wl_display_destroy_clients(server.wl_display);
+
+	struct keyboard *kb = NULL, *kb_tmp = NULL;
+	wl_list_for_each_safe(kb, kb_tmp, &server.keyboards, link) {
+		wl_list_remove(&kb->modifiers.link);
+		wl_list_remove(&kb->key.link);
+		wl_list_remove(&kb->destroy.link);
+		wl_list_remove(&kb->link);
+		free(kb);
+	}
+
+	glDeleteProgram(server.bg_prog);
+	glDeleteProgram(server.ui_prog);
+	glDeleteProgram(server.ext_prog);
+	glDeleteProgram(server.blur_prog);
+	glDeleteProgram(server.night_prog);
+	glDeleteTextures(1, &server.glyph_atlas);
+	glDeleteTextures(1, &server.bg_noise_tex);
+	glDeleteBuffers(1, &server.quad_vbo);
+	glDeleteBuffers(1, &server.inst_vbo);
+	FT_Done_Face(server.ft_face);
+	FT_Done_FreeType(server.ft_library);
+
 	wlr_xcursor_manager_destroy(server.xcursor_manager);
 	wlr_cursor_destroy(server.cursor);
 	wlr_allocator_destroy(server.allocator);

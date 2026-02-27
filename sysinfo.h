@@ -16,7 +16,32 @@ struct sysinfo {
 	bool caps_lock;
 };
 
-/* Fill sysinfo struct with current values */
+/* Profiling data for each metric (microseconds) */
+struct sysinfo_profile {
+	double battery_us;
+	double brightness_us;
+	double cpu_temp_us;
+	double cpu_freq_us;
+	double mem_us;
+	double wifi_signal_us;
+	double wifi_state_us;
+	double bluetooth_us;
+	double capslock_us;
+};
+
+/* Start background thread for gathering system info */
+void sysinfo_start(void);
+
+/* Stop background thread */
+void sysinfo_stop(void);
+
+/* Get current cached sysinfo (non-blocking) */
+void sysinfo_get(struct sysinfo *info);
+
+/* Get profiling data (last update times in microseconds) */
+void sysinfo_get_profile(struct sysinfo_profile *p);
+
+/* Fill sysinfo struct with current values (legacy, calls sysinfo_get) */
 void sysinfo_update(struct sysinfo *info);
 
 /* Adjust screen brightness by delta steps (positive = brighter) */
